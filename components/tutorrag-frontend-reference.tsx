@@ -99,6 +99,11 @@ type FolderItem = {
   system?: boolean;
 };
 
+type SSEParsedEvent = {
+  event: string;
+  data: any | null;
+};
+
 const PROVIDER_OPTIONS: ProviderOption[] = [
   {
     label: "Google AI",
@@ -306,6 +311,56 @@ function cn(...classes: Array<string | false | null | undefined>) {
   return classes.filter(Boolean).join(" ");
 }
 
+function parseSSEEvent(rawEvent: string): SSEParsedEvent {
+  const lines = rawEvent.split("\n");
+  let eventName = "message";
+  const dataLines: string[] = [];
+
+  for (const line of lines) {
+    if (line.startsWith("event:")) {
+      eventName = line.slice(6).trim();
+    } else if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).trim());
+    }
+  }
+
+  const rawData = dataLines.join("\n");
+  if (!rawData) {
+    return { event: eventName, data: null };
+  }
+
+  try {
+    return {
+      event: eventName,
+      data: JSON.parse(rawData),
+    };
+  } catch {
+    return {
+      event: eventName,
+      data: rawData,
+    };
+  }
+}
+
+function getStageLabel(stage?: string) {
+  switch (stage) {
+    case "classifying":
+      return "Đang phân loại câu hỏi...";
+    case "planning":
+      return "Đang lập kế hoạch truy hồi...";
+    case "routing":
+      return "Đang định tuyến khái niệm...";
+    case "retrieving":
+      return "Đang truy hồi tài liệu...";
+    case "generating":
+      return "Đang sinh câu trả lời...";
+    case "verifying":
+      return "Đang kiểm chứng câu trả lời...";
+    default:
+      return "TutorRAG đang xử lý...";
+  }
+}
+
 export default function TutorRAGFrontendRedesigned() {
   const [providerMode, setProviderMode] = useState("platform");
   const [provider, setProvider] = useState<string>("google_ai");
@@ -340,6 +395,8 @@ export default function TutorRAGFrontendRedesigned() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const activeReaderRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null);
+  const activeAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data: { session } }) => {
@@ -379,6 +436,13 @@ export default function TutorRAGFrontendRedesigned() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    return () => {
+      activeAbortRef.current?.abort();
+      activeReaderRef.current?.cancel().catch(() => undefined);
+    };
+  }, []);
 
   const providerLabel = useMemo(() => {
     if (providerMode === "platform") return "Shared model";
@@ -444,6 +508,8 @@ export default function TutorRAGFrontendRedesigned() {
   };
 
   const handleSignOut = async () => {
+    activeAbortRef.current?.abort();
+    activeReaderRef.current?.cancel().catch(() => undefined);
     await supabase.auth.signOut();
   };
 
@@ -499,6 +565,15 @@ export default function TutorRAGFrontendRedesigned() {
     };
   };
 
+  const buildChatHistory = (): Array<{ role: "user" | "assistant"; content: string }> => {
+    return messages
+      .filter((message) => !message.loading)
+      .map((message) => ({
+        role: message.role,
+        content: message.content,
+      }));
+  };
+
   const handleAsk = async () => {
     if (!question.trim()) return;
 
@@ -507,12 +582,21 @@ export default function TutorRAGFrontendRedesigned() {
       return;
     }
 
+    activeAbortRef.current?.abort();
+    activeReaderRef.current?.cancel().catch(() => undefined);
+
+    const abortController = new AbortController();
+    activeAbortRef.current = abortController;
+
     const userMessage = question.trim();
     const assistantMessageId = makeId("assistant");
 
     setIsAsking(true);
     setQuestion("");
     setSourceCitations([]);
+
+    const historyBeforeNewQuestion = buildChatHistory();
+
     setMessages((prev) => [
       ...prev,
       {
@@ -525,6 +609,7 @@ export default function TutorRAGFrontendRedesigned() {
         role: "assistant",
         content: "TutorRAG đang xử lý...",
         loading: true,
+        citations: [],
       },
     ]);
 
@@ -536,52 +621,191 @@ export default function TutorRAGFrontendRedesigned() {
         throw new Error("Không tìm thấy access token. Vui lòng đăng nhập lại.");
       }
 
-      const response = await fetch(`${API_BASE_URL}/chat/ask`, {
+      const response = await fetch(`${API_BASE_URL}/chat/ask/stream`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
+          Accept: "text/event-stream",
         },
         body: JSON.stringify({
           question: userMessage,
-          chat_history: [],
+          query_text: userMessage,
+          chat_history: historyBeforeNewQuestion,
           llm_config: buildLLMConfig(),
         }),
+        signal: abortController.signal,
       });
 
-      const result: BackendEnvelope = await response.json().catch(() => ({}));
-
       if (!response.ok) {
-        throw new Error(getErrorMessage(result, `Lỗi từ Backend: ${response.status}`));
+        const contentType = response.headers.get("content-type") || "";
+
+        if (contentType.includes("application/json")) {
+          const result: BackendEnvelope = await response.json().catch(() => ({}));
+          throw new Error(
+            getErrorMessage(result, `Lỗi từ Backend: ${response.status}`)
+          );
+        }
+
+        const rawText = await response.text().catch(() => "");
+        throw new Error(rawText || `Lỗi từ Backend: ${response.status}`);
       }
 
-      const payload = result.data ?? result;
-      const extractedAnswer =
-        pickAnswer(payload) || "Đã nhận được phản hồi nhưng không có text.";
-      const citations = pickCitations(payload);
+      if (!response.body) {
+        throw new Error("Backend không trả về stream.");
+      }
 
-      setSourceCitations(citations);
-      setMessages((prev) =>
-        prev.map((item) =>
-          item.id === assistantMessageId
-            ? {
-                ...item,
-                content: extractedAnswer,
-                citations,
-                loading: false,
-              }
-            : item
-        )
-      );
+      const reader = response.body.getReader();
+      activeReaderRef.current = reader;
+
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
+      let streamedText = "";
+      let finalPayload: any = null;
+
+      const updateAssistant = (
+        updater: (current: ChatMessage) => ChatMessage
+      ) => {
+        setMessages((prev) =>
+          prev.map((item) =>
+            item.id === assistantMessageId ? updater(item) : item
+          )
+        );
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+
+        for (const rawEvent of parts) {
+          const parsed = parseSSEEvent(rawEvent);
+          const eventName = parsed.event;
+          const payload = parsed.data;
+
+          if (eventName === "ping" || eventName === "meta" || eventName === "retrieval") {
+            continue;
+          }
+
+          if (eventName === "status") {
+            updateAssistant((current) => ({
+              ...current,
+              content: streamedText || getStageLabel(payload?.stage),
+              loading: true,
+            }));
+            continue;
+          }
+
+          if (eventName === "token") {
+            const nextText =
+              typeof payload?.text === "string" ? payload.text : "";
+
+            if (!nextText) continue;
+
+            streamedText += nextText;
+
+            updateAssistant((current) => ({
+              ...current,
+              content: streamedText,
+              loading: true,
+            }));
+            continue;
+          }
+
+          if (eventName === "final") {
+            finalPayload = payload;
+
+            const extractedAnswer =
+              pickAnswer(payload) ||
+              streamedText ||
+              "Đã nhận được phản hồi nhưng không có text.";
+
+            const citations = pickCitations(payload);
+            setSourceCitations(citations);
+
+            updateAssistant((current) => ({
+              ...current,
+              content: extractedAnswer,
+              citations,
+              loading: false,
+            }));
+            continue;
+          }
+
+          if (eventName === "error") {
+            throw new Error(
+              payload?.message || "Lỗi stream từ Backend."
+            );
+          }
+        }
+      }
+
+      if (buffer.trim()) {
+        const parsed = parseSSEEvent(buffer.trim());
+        if (parsed.event === "final") {
+          finalPayload = parsed.data;
+
+          const extractedAnswer =
+            pickAnswer(parsed.data) ||
+            streamedText ||
+            "Đã nhận được phản hồi nhưng không có text.";
+
+          const citations = pickCitations(parsed.data);
+          setSourceCitations(citations);
+
+          setMessages((prev) =>
+            prev.map((item) =>
+              item.id === assistantMessageId
+                ? {
+                    ...item,
+                    content: extractedAnswer,
+                    citations,
+                    loading: false,
+                  }
+                : item
+            )
+          );
+        }
+      }
+
+      if (!finalPayload) {
+        const fallbackAnswer =
+          streamedText || "Đã kết thúc stream nhưng không có payload cuối.";
+
+        setSourceCitations([]);
+
+        setMessages((prev) =>
+          prev.map((item) =>
+            item.id === assistantMessageId
+              ? {
+                  ...item,
+                  content: fallbackAnswer,
+                  citations: [],
+                  loading: false,
+                }
+              : item
+          )
+        );
+      }
     } catch (error: any) {
       console.error(error);
+
+      const message =
+        error?.name === "AbortError"
+          ? "Yêu cầu đã bị hủy."
+          : "Oops! Lỗi kết nối đến Backend: " + error.message;
+
       setSourceCitations([]);
       setMessages((prev) =>
         prev.map((item) =>
           item.id === assistantMessageId
             ? {
                 ...item,
-                content: "Oops! Lỗi kết nối đến Backend: " + error.message,
+                content: message,
                 citations: [],
                 loading: false,
               }
@@ -589,6 +813,8 @@ export default function TutorRAGFrontendRedesigned() {
         )
       );
     } finally {
+      activeReaderRef.current = null;
+      activeAbortRef.current = null;
       setIsAsking(false);
     }
   };
