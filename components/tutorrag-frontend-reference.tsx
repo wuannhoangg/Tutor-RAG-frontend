@@ -123,48 +123,15 @@ const PROVIDER_OPTIONS: ProviderOption[] = [
     defaultModel: "claude-3-5-haiku-latest",
     defaultBaseUrl: "",
   },
-  {
-    label: "Ollama",
-    value: "ollama",
-    defaultModel: "llama3.1",
-    defaultBaseUrl: "http://localhost:11434",
-  },
-  {
-    label: "LM Studio",
-    value: "lm_studio",
-    defaultModel: "local-model",
-    defaultBaseUrl: "http://localhost:1234/v1",
-  },
 ];
 
 const BYOK_PROVIDER_VALUES = ["google_ai", "openai", "anthropic"];
-const LOCAL_PROVIDER_VALUES = ["ollama", "lm_studio"];
 
 const initialFolders: FolderItem[] = [
   { id: "all", name: "All documents", system: true },
-  { id: "uploads", name: "Uploads", system: true },
 ];
 
-const initialFiles: UploadedFile[] = [
-  {
-    name: "Database_Design.pdf",
-    pages: 45,
-    status: "Indexed",
-    folderId: "uploads",
-  },
-  {
-    name: "SQL_Notes.docx",
-    pages: 12,
-    status: "Indexed",
-    folderId: "uploads",
-  },
-  {
-    name: "Normalization.pptx",
-    pages: 28,
-    status: "Indexed",
-    folderId: "uploads",
-  },
-];
+const initialFiles: UploadedFile[] = [];
 
 function getProviderMeta(value: string): ProviderOption {
   return (
@@ -361,8 +328,31 @@ function getStageLabel(stage?: string) {
   }
 }
 
+function cleanStreamedChunkCitations(text: string): string {
+  if (!text) return text;
+
+  const seen: string[] = [];
+
+  const withNumericRefs = text.replace(
+    /\[([A-Za-z0-9]+_chunk_\d+)\]/g,
+    (_match, chunkId: string) => {
+      if (!seen.includes(chunkId)) {
+        seen.push(chunkId);
+      }
+      return `[${seen.indexOf(chunkId) + 1}]`;
+    }
+  );
+
+  return withNumericRefs
+    .replace(/\b([A-Za-z0-9]+_chunk_\d+)\b/g, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/\s+([.,;:!?])/g, "$1")
+    .trim();
+}
+
 export default function TutorRAGFrontendRedesigned() {
-  const [providerMode, setProviderMode] = useState("platform");
+  const [providerMode, setProviderMode] = useState<"platform" | "byok">("platform");
   const [provider, setProvider] = useState<string>("google_ai");
   const [apiKey, setApiKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
@@ -415,11 +405,6 @@ export default function TutorRAGFrontendRedesigned() {
   useEffect(() => {
     if (providerMode === "byok" && !BYOK_PROVIDER_VALUES.includes(provider)) {
       setProvider("google_ai");
-      return;
-    }
-
-    if (providerMode === "local" && !LOCAL_PROVIDER_VALUES.includes(provider)) {
-      setProvider("ollama");
     }
   }, [providerMode, provider]);
 
@@ -446,7 +431,6 @@ export default function TutorRAGFrontendRedesigned() {
 
   const providerLabel = useMemo(() => {
     if (providerMode === "platform") return "Shared model";
-    if (providerMode === "local") return "Local model";
     return "Bring your own key";
   }, [providerMode]);
 
@@ -483,6 +467,65 @@ export default function TutorRAGFrontendRedesigned() {
     return mapping;
   }, [uploadedFiles]);
 
+  const fetchWorkspace = async () => {
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+
+    if (!token) {
+      throw new Error("Không tìm thấy access token.");
+    }
+
+    const [foldersRes, documentsRes] = await Promise.all([
+      fetch(`${API_BASE_URL}/documents/folders`, {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+      fetch(`${API_BASE_URL}/documents`, {
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+    ]);
+
+    const foldersJson: BackendEnvelope<any[]> = await foldersRes.json().catch(() => ({}));
+    const documentsJson: BackendEnvelope<any[]> = await documentsRes.json().catch(() => ({}));
+
+    if (!foldersRes.ok) {
+      throw new Error(getErrorMessage(foldersJson, "Không tải được folders."));
+    }
+    if (!documentsRes.ok) {
+      throw new Error(getErrorMessage(documentsJson, "Không tải được documents."));
+    }
+
+    const backendFolders = Array.isArray(foldersJson.data) ? foldersJson.data : [];
+    const backendDocuments = Array.isArray(documentsJson.data) ? documentsJson.data : [];
+
+    const normalizedFolders: FolderItem[] = [
+      { id: "all", name: "All documents", system: true },
+      ...backendFolders.map((folder: any) => ({
+        id: folder.folder_id,
+        name: folder.name,
+        system: !!folder.system,
+      })),
+    ];
+
+    const normalizedFiles: UploadedFile[] = backendDocuments.map((doc: any) => ({
+      name: doc.name || "Untitled",
+      pages: doc.chunk_count ?? "-",
+      status: doc.status || "Indexed",
+      documentId: doc.document_id,
+      folderId: doc.folder_id || "uploads",
+    }));
+
+    setFolders(normalizedFolders);
+    setUploadedFiles(normalizedFiles);
+  };
+
+  useEffect(() => {
+    if (!user) return;
+
+    fetchWorkspace().catch((error) => {
+      console.error("Failed to fetch workspace", error);
+    });
+  }, [user]);
+
   const handleSignUp = async () => {
     setLoadingAuth(true);
     const { error } = await supabase.auth.signUp({ email, password });
@@ -513,9 +556,9 @@ export default function TutorRAGFrontendRedesigned() {
     await supabase.auth.signOut();
   };
 
-  const handleCreateFolder = () => {
+  const handleCreateFolder = async () => {
     const trimmed = newFolderName.trim();
-    if (!trimmed) return;
+    if (!trimmed || !user) return;
 
     const exists = folders.some(
       (folder) => folder.name.toLowerCase() === trimmed.toLowerCase()
@@ -525,16 +568,44 @@ export default function TutorRAGFrontendRedesigned() {
       return;
     }
 
-    const newFolder = {
-      id: makeId("folder"),
-      name: trimmed,
-      system: false,
-    };
+    try {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
 
-    setFolders((prev) => [...prev, newFolder]);
-    setActiveFolderId(newFolder.id);
-    setNewFolderName("");
-    setIsCreatingFolder(false);
+      if (!token) {
+        throw new Error("Không tìm thấy access token.");
+      }
+
+      const response = await fetch(`${API_BASE_URL}/documents/folders`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ name: trimmed }),
+      });
+
+      const result: BackendEnvelope<any> = await response.json().catch(() => ({}));
+
+      if (!response.ok) {
+        throw new Error(getErrorMessage(result, `Lỗi từ Backend: ${response.status}`));
+      }
+
+      const folder = result.data;
+      const newFolder: FolderItem = {
+        id: folder.folder_id,
+        name: folder.name,
+        system: !!folder.system,
+      };
+
+      setFolders((prev) => [...prev, newFolder]);
+      setActiveFolderId(newFolder.id);
+      setNewFolderName("");
+      setIsCreatingFolder(false);
+    } catch (error: any) {
+      console.error(error);
+      alert("Không tạo được folder: " + error.message);
+    }
   };
 
   const buildLLMConfig = () => {
@@ -546,18 +617,8 @@ export default function TutorRAGFrontendRedesigned() {
     const trimmedBaseUrl = baseUrl.trim();
     const trimmedApiKey = apiKey.trim();
 
-    if (providerMode === "byok") {
-      return {
-        mode: "byok",
-        provider,
-        api_key: trimmedApiKey || undefined,
-        base_url: trimmedBaseUrl || undefined,
-        model: trimmedModel || undefined,
-      };
-    }
-
     return {
-      mode: "local_runtime",
+      mode: "byok",
       provider,
       api_key: trimmedApiKey || undefined,
       base_url: trimmedBaseUrl || undefined,
@@ -660,7 +721,7 @@ export default function TutorRAGFrontendRedesigned() {
 
       const decoder = new TextDecoder("utf-8");
       let buffer = "";
-      let streamedText = "";
+      let streamedRawText = "";
       let finalPayload: any = null;
 
       const updateAssistant = (
@@ -694,7 +755,7 @@ export default function TutorRAGFrontendRedesigned() {
           if (eventName === "status") {
             updateAssistant((current) => ({
               ...current,
-              content: streamedText || getStageLabel(payload?.stage),
+              content: cleanStreamedChunkCitations(streamedRawText) || getStageLabel(payload?.stage),
               loading: true,
             }));
             continue;
@@ -706,11 +767,12 @@ export default function TutorRAGFrontendRedesigned() {
 
             if (!nextText) continue;
 
-            streamedText += nextText;
+            streamedRawText += nextText;
+            const cleanedStreamedText = cleanStreamedChunkCitations(streamedRawText);
 
             updateAssistant((current) => ({
               ...current,
-              content: streamedText,
+              content: cleanedStreamedText,
               loading: true,
             }));
             continue;
@@ -720,8 +782,8 @@ export default function TutorRAGFrontendRedesigned() {
             finalPayload = payload;
 
             const extractedAnswer =
-              pickAnswer(payload) ||
-              streamedText ||
+              cleanStreamedChunkCitations(pickAnswer(payload)) ||
+              cleanStreamedChunkCitations(streamedRawText) ||
               "Đã nhận được phản hồi nhưng không có text.";
 
             const citations = pickCitations(payload);
@@ -750,8 +812,8 @@ export default function TutorRAGFrontendRedesigned() {
           finalPayload = parsed.data;
 
           const extractedAnswer =
-            pickAnswer(parsed.data) ||
-            streamedText ||
+            cleanStreamedChunkCitations(pickAnswer(parsed.data)) ||
+            cleanStreamedChunkCitations(streamedRawText) ||
             "Đã nhận được phản hồi nhưng không có text.";
 
           const citations = pickCitations(parsed.data);
@@ -774,7 +836,7 @@ export default function TutorRAGFrontendRedesigned() {
 
       if (!finalPayload) {
         const fallbackAnswer =
-          streamedText || "Đã kết thúc stream nhưng không có payload cuối.";
+          cleanStreamedChunkCitations(streamedRawText) || "Đã kết thúc stream nhưng không có payload cuối.";
 
         setSourceCitations([]);
 
@@ -851,9 +913,15 @@ export default function TutorRAGFrontendRedesigned() {
         throw new Error("Không tìm thấy access token. Vui lòng đăng nhập lại.");
       }
 
+      const targetFolderId =
+        activeFolderId === "all"
+          ? folders.find((folder) => folder.name === "Uploads")?.id || "uploads"
+          : activeFolderId;
+
       const formData = new FormData();
       formData.append("file", file);
       formData.append("language", "vi");
+      formData.append("folder_id", targetFolderId);
 
       const response = await fetch(`${API_BASE_URL}/upload/file`, {
         method: "POST",
@@ -878,7 +946,6 @@ export default function TutorRAGFrontendRedesigned() {
       }
 
       const payload = result.data ?? {};
-      const targetFolderId = activeFolderId === "all" ? "uploads" : activeFolderId;
 
       alert("Tải lên và xử lý tài liệu thành công!");
 
@@ -1336,16 +1403,13 @@ export default function TutorRAGFrontendRedesigned() {
                     </Badge>
                   </div>
 
-                  <Tabs value={providerMode} onValueChange={setProviderMode}>
-                    <TabsList className="grid h-11 grid-cols-3 rounded-full bg-white/[0.06] p-1">
+                  <Tabs value={providerMode} onValueChange={(value) => setProviderMode(value as "platform" | "byok")}>
+                    <TabsList className="grid h-11 grid-cols-2 rounded-full bg-white/[0.06] p-1">
                       <TabsTrigger value="platform" className={renderTabsTriggerClassName}>
                         Platform
                       </TabsTrigger>
                       <TabsTrigger value="byok" className={renderTabsTriggerClassName}>
                         BYOK
-                      </TabsTrigger>
-                      <TabsTrigger value="local" className={renderTabsTriggerClassName}>
-                        Local
                       </TabsTrigger>
                     </TabsList>
 
@@ -1394,35 +1458,7 @@ export default function TutorRAGFrontendRedesigned() {
                       />
                     </TabsContent>
 
-                    <TabsContent value="local" className="mt-4 space-y-3">
-                      <Select value={provider} onValueChange={setProvider}>
-                        <SelectTrigger className="h-11 rounded-2xl border-white/10 bg-black/30 text-white">
-                          <SelectValue placeholder="Choose local runtime" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {PROVIDER_OPTIONS.filter((item) =>
-                            LOCAL_PROVIDER_VALUES.includes(item.value)
-                          ).map((item) => (
-                            <SelectItem key={item.value} value={item.value}>
-                              {item.label}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-
-                      <Input
-                        value={baseUrl}
-                        onChange={(e) => setBaseUrl(e.target.value)}
-                        className="h-11 rounded-2xl border-white/10 bg-black/30 text-white"
-                        placeholder="Local base URL"
-                      />
-                      <Input
-                        value={modelName}
-                        onChange={(e) => setModelName(e.target.value)}
-                        className="h-11 rounded-2xl border-white/10 bg-black/30 text-white"
-                        placeholder="Local model"
-                      />
-                    </TabsContent>
+                    
                   </Tabs>
 
                   <div className="grid gap-3">
