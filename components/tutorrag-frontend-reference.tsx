@@ -312,17 +312,17 @@ function parseSSEEvent(rawEvent: string): SSEParsedEvent {
 function getStageLabel(stage?: string) {
   switch (stage) {
     case "classifying":
-      return "Đang phân loại câu hỏi...";
+      return "classifying...";
     case "planning":
-      return "Đang lập kế hoạch truy hồi...";
+      return "planning...";
     case "routing":
-      return "Đang định tuyến khái niệm...";
+      return "routing...";
     case "retrieving":
-      return "Đang truy hồi tài liệu...";
+      return "retrieving...";
     case "generating":
-      return "Đang sinh câu trả lời...";
+      return "generating...";
     case "verifying":
-      return "Đang kiểm chứng câu trả lời...";
+      return "verifying...";
     default:
       return "TutorRAG đang xử lý...";
   }
