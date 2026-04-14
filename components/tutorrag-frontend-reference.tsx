@@ -351,6 +351,29 @@ function cleanStreamedChunkCitations(text: string): string {
     .trim();
 }
 
+function resolveDefaultUploadFolderId(
+  folders: FolderItem[],
+  activeFolderId: string
+): string | null {
+  if (activeFolderId !== "all") {
+    return activeFolderId;
+  }
+
+  const systemFolder = folders.find(
+    (folder) => folder.id !== "all" && folder.system
+  );
+  if (systemFolder) {
+    return systemFolder.id;
+  }
+
+  const firstRealFolder = folders.find((folder) => folder.id !== "all");
+  if (firstRealFolder) {
+    return firstRealFolder.id;
+  }
+
+  return null;
+}
+
 export default function TutorRAGFrontendRedesigned() {
   const [providerMode, setProviderMode] = useState<"platform" | "byok">("platform");
   const [provider, setProvider] = useState<string>("google_ai");
@@ -524,11 +547,18 @@ export default function TutorRAGFrontendRedesigned() {
       pages: doc.chunk_count ?? "-",
       status: doc.status || "Indexed",
       documentId: doc.document_id,
-      folderId: doc.folder_id || "uploads",
+      folderId: doc.folder_id ?? undefined,
     }));
 
     setFolders(normalizedFolders);
     setUploadedFiles(normalizedFiles);
+
+    const folderStillExists = normalizedFolders.some(
+      (folder) => folder.id === activeFolderId
+    );
+    if (!folderStillExists) {
+      setActiveFolderId("all");
+    }
   };
 
   useEffect(() => {
@@ -967,6 +997,16 @@ export default function TutorRAGFrontendRedesigned() {
       return;
     }
 
+    const targetFolderId = resolveDefaultUploadFolderId(folders, activeFolderId);
+
+    if (!targetFolderId) {
+      alert("Bạn chưa có folder nào để tải tài liệu. Hãy tạo một folder trước.");
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      return;
+    }
+
     setIsUploading(true);
 
     try {
@@ -976,11 +1016,6 @@ export default function TutorRAGFrontendRedesigned() {
       if (!token) {
         throw new Error("Không tìm thấy access token. Vui lòng đăng nhập lại.");
       }
-
-      const targetFolderId =
-        activeFolderId === "all"
-          ? folders.find((folder) => folder.name === "Uploads")?.id || "uploads"
-          : activeFolderId;
 
       const formData = new FormData();
       formData.append("file", file);
@@ -1002,6 +1037,7 @@ export default function TutorRAGFrontendRedesigned() {
           original_filename?: string;
           subject?: string | null;
           language?: string;
+          folder_id?: string | null;
         };
       }> = await response.json().catch(() => ({}));
 
@@ -1010,6 +1046,7 @@ export default function TutorRAGFrontendRedesigned() {
       }
 
       const payload = result.data ?? {};
+      const savedFolderId = payload?.metadata?.folder_id || targetFolderId;
 
       alert("Tải lên và xử lý tài liệu thành công!");
 
@@ -1019,7 +1056,7 @@ export default function TutorRAGFrontendRedesigned() {
         status: "Indexed",
         documentId: payload?.document_id,
         chunkCount: payload?.chunk_count,
-        folderId: targetFolderId,
+        folderId: savedFolderId || undefined,
       };
 
       setUploadedFiles((prev) => [newFile, ...prev]);
