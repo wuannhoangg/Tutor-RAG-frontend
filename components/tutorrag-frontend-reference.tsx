@@ -178,7 +178,7 @@ function normalizeCitation(item: any): CitationItem {
     page: item?.page,
     page_start: item?.page_start ?? item?.pageStart,
     page_end: item?.page_end ?? item?.pageEnd,
-    snippet: item?.snippet || item?.text,
+    snippet: item?.snippet || item?.text || item?.metadata?.snippet,
     metadata: item?.metadata,
   };
 }
@@ -363,6 +363,8 @@ export default function TutorRAGFrontendRedesigned() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [user, setUser] = useState<any>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [authNotice, setAuthNotice] = useState("");
   const [loadingAuth, setLoadingAuth] = useState(false);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
@@ -389,17 +391,26 @@ export default function TutorRAGFrontendRedesigned() {
   const activeAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
+    let mounted = true;
+
     supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!mounted) return;
       setUser(session?.user ?? null);
+      setAuthReady(true);
     });
 
     const {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!mounted) return;
       setUser(session?.user ?? null);
+      setAuthReady(true);
     });
 
-    return () => subscription.unsubscribe();
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
   }, []);
 
   useEffect(() => {
@@ -467,6 +478,8 @@ export default function TutorRAGFrontendRedesigned() {
     return mapping;
   }, [uploadedFiles]);
 
+  const emailConfirmed = !!user?.email_confirmed_at;
+
   const fetchWorkspace = async () => {
     const { data } = await supabase.auth.getSession();
     const token = data.session?.access_token;
@@ -519,32 +532,72 @@ export default function TutorRAGFrontendRedesigned() {
   };
 
   useEffect(() => {
+    if (!authReady) return;
     if (!user) return;
+    if (!emailConfirmed) return;
 
     fetchWorkspace().catch((error) => {
       console.error("Failed to fetch workspace", error);
+      setAuthNotice(error.message || "Không tải được workspace.");
     });
-  }, [user]);
+  }, [authReady, user, emailConfirmed]);
 
   const handleSignUp = async () => {
     setLoadingAuth(true);
-    const { error } = await supabase.auth.signUp({ email, password });
+    setAuthNotice("");
+
+    const { data, error } = await supabase.auth.signUp({ email, password });
 
     if (error) {
       alert(error.message);
-    } else {
-      alert("Đăng ký thành công! Hãy đăng nhập.");
+      setLoadingAuth(false);
+      return;
     }
 
+    if (data.user && !data.session) {
+      setAuthNotice("Đăng ký thành công. Hãy kiểm tra email để xác thực tài khoản trước khi đăng nhập.");
+      alert("Đăng ký thành công. Hãy kiểm tra email để xác thực tài khoản.");
+      setLoadingAuth(false);
+      return;
+    }
+
+    if (data.session && !data.user?.email_confirmed_at) {
+      setAuthNotice("Tài khoản đã được tạo nhưng chưa xác thực email. Hãy kiểm tra email trước khi dùng hệ thống.");
+      alert("Tài khoản đã được tạo. Hãy xác thực email trước khi đăng nhập.");
+      await supabase.auth.signOut();
+      setLoadingAuth(false);
+      return;
+    }
+
+    setAuthNotice("Đăng ký thành công. Bạn có thể đăng nhập.");
+    alert("Đăng ký thành công!");
     setLoadingAuth(false);
   };
 
   const handleSignIn = async () => {
     setLoadingAuth(true);
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    setAuthNotice("");
+
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
 
     if (error) {
       alert(error.message);
+      setLoadingAuth(false);
+      return;
+    }
+
+    if (!data.session) {
+      alert("Đăng nhập thất bại: không nhận được session.");
+      setLoadingAuth(false);
+      return;
+    }
+
+    if (!data.user?.email_confirmed_at) {
+      setAuthNotice("Email của bạn chưa được xác thực. Hãy xác thực email trước khi đăng nhập.");
+      alert("Email chưa được xác thực.");
+      await supabase.auth.signOut();
+      setLoadingAuth(false);
+      return;
     }
 
     setLoadingAuth(false);
@@ -553,6 +606,7 @@ export default function TutorRAGFrontendRedesigned() {
   const handleSignOut = async () => {
     activeAbortRef.current?.abort();
     activeReaderRef.current?.cancel().catch(() => undefined);
+    setAuthNotice("");
     await supabase.auth.signOut();
   };
 
@@ -640,6 +694,11 @@ export default function TutorRAGFrontendRedesigned() {
 
     if (!user) {
       alert("Vui lòng đăng nhập trước khi hỏi AI nhé!");
+      return;
+    }
+
+    if (!emailConfirmed) {
+      alert("Bạn cần xác thực email trước khi sử dụng hệ thống.");
       return;
     }
 
@@ -903,6 +962,11 @@ export default function TutorRAGFrontendRedesigned() {
       return;
     }
 
+    if (!emailConfirmed) {
+      alert("Bạn cần xác thực email trước khi tải tài liệu.");
+      return;
+    }
+
     setIsUploading(true);
 
     try {
@@ -974,7 +1038,15 @@ export default function TutorRAGFrontendRedesigned() {
   const renderTabsTriggerClassName =
     "rounded-full px-4 text-sm text-white/72 transition data-[state=active]:bg-white data-[state=active]:text-black data-[state=active]:shadow-sm hover:text-white";
 
-  if (!user) {
+  if (!authReady) {
+    return (
+      <div className="min-h-screen bg-[#050505] text-white flex items-center justify-center">
+        Đang khởi tạo phiên...
+      </div>
+    );
+  }
+
+  if (!user || !emailConfirmed) {
     return (
       <div className="min-h-screen overflow-hidden bg-[#050505] text-white">
         <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(255,255,255,0.08),transparent_32%),radial-gradient(circle_at_bottom_right,rgba(255,255,255,0.05),transparent_24%)]" />
@@ -1064,6 +1136,12 @@ export default function TutorRAGFrontendRedesigned() {
                       </Button>
                     </TabsContent>
                   </Tabs>
+
+                  {authNotice ? (
+                    <div className="mt-4 rounded-2xl border border-white/10 bg-black/30 p-3 text-sm text-white/75">
+                      {authNotice}
+                    </div>
+                  ) : null}
                 </CardContent>
               </Card>
             </motion.div>
@@ -1457,8 +1535,6 @@ export default function TutorRAGFrontendRedesigned() {
                         placeholder="Base URL"
                       />
                     </TabsContent>
-
-                    
                   </Tabs>
 
                   <div className="grid gap-3">
@@ -1476,6 +1552,12 @@ export default function TutorRAGFrontendRedesigned() {
                       </div>
                     ))}
                   </div>
+
+                  {authNotice ? (
+                    <div className="rounded-[22px] border border-white/10 bg-black/30 p-4 text-sm text-white/72">
+                      {authNotice}
+                    </div>
+                  ) : null}
                 </CardContent>
               </Card>
             </div>
